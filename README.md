@@ -159,6 +159,7 @@ Recommended minimum for this repository (Hosting + Firestore rules/indexes):
 - `roles/firebase.admin`
 - `roles/serviceusage.apiKeysViewer`
 - `roles/serviceusage.serviceUsageAdmin` (or pre-enable required APIs and grant at least permissions that include `serviceusage.services.get`)
+- `firebaserules.rulesets.test`
 
 If workflow fails with:
 
