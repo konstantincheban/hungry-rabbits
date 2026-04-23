@@ -152,7 +152,19 @@ Add these repository secrets in `Settings -> Secrets and variables -> Actions`:
 
 Create service account key JSON once (Firebase Console -> Project settings -> Service accounts -> Generate new private key), then store the full JSON content in `FIREBASE_SERVICE_ACCOUNT_KEY`.
 
-Grant this service account permissions needed for deploy (for example Firebase Hosting Admin + Cloud Datastore/Firebase Rules related permissions used by your deploy scope).
+Grant this service account permissions needed for deploy.
+
+Recommended minimum for this repository (Hosting + Firestore rules/indexes):
+
+- `roles/firebase.admin`
+- `roles/serviceusage.apiKeysViewer`
+- `roles/serviceusage.serviceUsageAdmin` (or pre-enable required APIs and grant at least permissions that include `serviceusage.services.get`)
+
+If workflow fails with:
+
+`Permission denied to get service [firestore.googleapis.com]`
+
+then your deploy principal is missing Service Usage permissions (at least `serviceusage.services.get`).
 
 ## Controls
 
