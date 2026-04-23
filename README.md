@@ -39,19 +39,19 @@ Hungry Rabbits is a mobile-first PixiJS mini-game demo built with TypeScript and
 npm install
 ```
 
-2. Copy environment template and fill Firebase values:
+1. Copy environment template and fill Firebase values:
 
 ```bash
 cp .env.example .env
 ```
 
-3. Run locally:
+1. Run locally:
 
 ```bash
 npm run dev
 ```
 
-4. Build production bundle:
+1. Build production bundle:
 
 ```bash
 npm run build
@@ -72,6 +72,7 @@ VITE_GAME_URL=
 ```
 
 Notes:
+
 - Leaderboard works only when Firebase variables are configured.
 - `VITE_GAME_URL` is optional. If omitted, QR page uses current site origin.
 
@@ -87,9 +88,11 @@ npx firebase-tools deploy --only firestore:rules
 ```
 
 Collection used:
+
 - `leaderboard`
 
 Document shape:
+
 - `username: string`
 - `score: number`
 - `createdAt: string` (ISO timestamp)
@@ -97,6 +100,7 @@ Document shape:
 ## Public Demo Deployment
 
 Repository includes:
+
 - `firebase.json`
 - `firestore.rules`
 - `firestore.indexes.json`
@@ -138,20 +142,17 @@ This repository now includes:
 Add these repository secrets in `Settings -> Secrets and variables -> Actions`:
 
 - `FIREBASE_PROJECT_ID`
-- `FIREBASE_TOKEN`
+- `FIREBASE_SERVICE_ACCOUNT_KEY`
 - `VITE_FIREBASE_API_KEY`
 - `VITE_FIREBASE_AUTH_DOMAIN`
-- `VITE_FIREBASE_PROJECT_ID`
 - `VITE_FIREBASE_STORAGE_BUCKET`
 - `VITE_FIREBASE_MESSAGING_SENDER_ID`
 - `VITE_FIREBASE_APP_ID`
 - `VITE_GAME_URL` (optional)
 
-Generate `FIREBASE_TOKEN` once:
+Create service account key JSON once (Firebase Console -> Project settings -> Service accounts -> Generate new private key), then store the full JSON content in `FIREBASE_SERVICE_ACCOUNT_KEY`.
 
-```bash
-npx firebase-tools login:ci
-```
+Grant this service account permissions needed for deploy (for example Firebase Hosting Admin + Cloud Datastore/Firebase Rules related permissions used by your deploy scope).
 
 ## Controls
 
