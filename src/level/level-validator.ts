@@ -18,6 +18,7 @@ export function validateGeneratedLevel(
   validateDensity(level, reasons);
   validateTopSurfaces(level, reasons);
   validateGeometryIntegrity(level, reasons);
+  validateMotifReadability(level, reasons);
   validateSilhouette(level, reasons);
 
   const uniqueReasons = dedupeReasons(reasons);
@@ -191,6 +192,52 @@ function validateGeometryIntegrity(level: GeneratedLevelDraft, reasons: string[]
   }
 }
 
+function validateMotifReadability(level: GeneratedLevelDraft, reasons: string[]): void {
+  const nonGroundModules = level.modules.filter((module) => module.kind !== 'ground-strip');
+  if (nonGroundModules.length < 4) {
+    return;
+  }
+
+  let connectedPairs = 0;
+  for (let index = 0; index < nonGroundModules.length; index += 1) {
+    const current = nonGroundModules[index]!;
+    const currentCenter = getRectCenter(current.bounds);
+
+    let hasNeighbour = false;
+    for (let otherIndex = index + 1; otherIndex < nonGroundModules.length; otherIndex += 1) {
+      const other = nonGroundModules[otherIndex]!;
+      const otherCenter = getRectCenter(other.bounds);
+      const colDistance = Math.abs(currentCenter.col - otherCenter.col);
+      const rowDistance = Math.abs(currentCenter.row - otherCenter.row);
+
+      if (colDistance <= 6 && rowDistance <= 5) {
+        connectedPairs += 1;
+        hasNeighbour = true;
+      }
+    }
+
+    if (!hasNeighbour) {
+      const nearest = nonGroundModules
+        .filter((candidate) => candidate !== current)
+        .reduce((best, candidate) => {
+          const candidateCenter = getRectCenter(candidate.bounds);
+          const delta = Math.abs(currentCenter.col - candidateCenter.col) + Math.abs(currentCenter.row - candidateCenter.row);
+          return Math.min(best, delta);
+        }, Number.POSITIVE_INFINITY);
+
+      if (nearest > 10) {
+        reasons.push('Занадто багато ізольованих модулів без мотивної зв’язності.');
+        return;
+      }
+    }
+  }
+
+  const minConnectedPairs = Math.max(2, Math.floor(nonGroundModules.length * 0.22));
+  if (connectedPairs < minConnectedPairs) {
+    reasons.push('Недостатньо зв’язаних структурних груп для читабельного рівня.');
+  }
+}
+
 function validateSilhouette(level: GeneratedLevelDraft, reasons: string[]): void {
   const highestByCol = new Map<number, number>();
 
@@ -227,6 +274,13 @@ function computeMetrics(level: GeneratedLevelDraft): LevelMetrics {
     occupiedTileRatio: level.blockedCells.length / Math.max(1, level.cols * level.rows),
     maxHeightUsed: level.rows - minRow,
     standableSurfaceCount: level.standableCells.length,
+  };
+}
+
+function getRectCenter(rect: GridRect): { col: number; row: number } {
+  return {
+    col: rect.col + ((rect.width - 1) * 0.5),
+    row: rect.row + ((rect.height - 1) * 0.5),
   };
 }
 

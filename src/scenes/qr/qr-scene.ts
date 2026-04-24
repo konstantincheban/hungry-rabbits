@@ -110,14 +110,16 @@ export function createQrScene({ sceneController }: SceneContext): Scene {
 
   async function buildQr(): Promise<void> {
     const gameUrl = getGameUrl();
+    const qrPixels = Math.round(clamp(Math.min(lastWidth, lastHeight) * 1.3, 512, 1024));
 
     statusLabel.text = 'Генеруємо QR...';
     statusLabel.tint = 0xcbd5e1;
     urlLabel.text = formatDisplayUrl(gameUrl);
 
     try {
-      const dataUrl = await QRCode.toDataURL(gameUrl, {
-        width: 768,
+      const canvas = document.createElement('canvas');
+      await QRCode.toCanvas(canvas, gameUrl, {
+        width: qrPixels,
         margin: 1,
         errorCorrectionLevel: 'H',
         color: {
@@ -131,9 +133,10 @@ export function createQrScene({ sceneController }: SceneContext): Scene {
       }
 
       removeCurrentQrSprite();
-      const texture = Texture.from(dataUrl);
+      const texture = Texture.from(canvas);
       qrSprite = new Sprite(texture);
-      container.addChild(qrSprite);
+      const insertIndex = container.getChildIndex(qrFrame) + 1;
+      container.addChildAt(qrSprite, insertIndex);
 
       layout(lastWidth, lastHeight);
       statusLabel.text = 'Скануйте код, щоб відкрити гру.';

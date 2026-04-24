@@ -30,12 +30,15 @@ body {
   background-attachment: fixed;
 }
 
+body.game-scene-active {
+  background-image: none;
+}
+
 #app {
   position: fixed;
   inset: 0;
   width: 100vw;
   height: 100dvh;
-  min-width: var(--app-min-width, 768px);
   max-width: none;
   min-height: 0;
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)

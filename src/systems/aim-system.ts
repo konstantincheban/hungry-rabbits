@@ -10,13 +10,10 @@ interface AimChangedPayload {
 interface AimSystemOptions {
   minAngleRad: number;
   maxAngleRad: number;
-  maxDragDistance: number;
-  minPullDistance?: number;
-  minAngleDragDistance?: number;
+  maxPullDistancePx: number;
+  activationRadiusPx?: number;
+  minPullDistancePx?: number;
   angleSmoothing?: number;
-  frontPowerScale?: number;
-  behindPowerScale?: number;
-  sideSwitchDeadzone?: number;
   powerCurveExponent?: number;
   getAimOrigin: () => Vector2;
   canShoot: () => boolean;
@@ -26,24 +23,25 @@ interface AimSystemOptions {
 
 export class AimSystem {
   private dragging = false;
-  private dragStart: Vector2 | null = null;
-  private dragMode: 'front' | 'behind' = 'front';
   private angleRad = -0.6;
   private powerRatio = 0.45;
-  private activeMaxDragDistance: number;
+  private activeMaxPullDistance: number;
 
   private readonly onPointerDown = (event: FederatedPointerEvent): void => {
     if (!this.options.canShoot()) {
       return;
     }
 
+    const localPointer = this.toLocalPointer(event.global);
+    const origin = this.options.getAimOrigin();
+    const activationRadius = Math.max(16, this.options.activationRadiusPx ?? 82);
+
+    if (distance(localPointer, origin) > activationRadius) {
+      return;
+    }
+
     this.dragging = true;
-    this.dragStart = {
-      x: event.global.x,
-      y: event.global.y,
-    };
-    this.dragMode = this.resolveDragMode(event.global.x);
-    this.powerRatio = 0;
+    this.updateAimFromPointer(localPointer);
     this.emitAimChanged();
   };
 
@@ -52,7 +50,7 @@ export class AimSystem {
       return;
     }
 
-    this.updateAimFromDrag(event.global);
+    this.updateAimFromPointer(this.toLocalPointer(event.global));
     this.emitAimChanged();
   };
 
@@ -61,10 +59,8 @@ export class AimSystem {
       return;
     }
 
-    this.updateAimFromDrag(event.global);
+    this.updateAimFromPointer(this.toLocalPointer(event.global));
     this.dragging = false;
-    this.dragStart = null;
-    this.dragMode = 'front';
     this.emitAimChanged();
 
     if (!this.options.canShoot()) {
@@ -84,8 +80,6 @@ export class AimSystem {
     }
 
     this.dragging = false;
-    this.dragStart = null;
-    this.dragMode = 'front';
     this.powerRatio = 0;
     this.emitAimChanged();
   };
@@ -94,7 +88,7 @@ export class AimSystem {
     private readonly interactionLayer: Container,
     private readonly options: AimSystemOptions,
   ) {
-    this.activeMaxDragDistance = Math.max(20, options.maxDragDistance);
+    this.activeMaxPullDistance = Math.max(24, options.maxPullDistancePx);
 
     this.interactionLayer.eventMode = 'static';
     this.interactionLayer.cursor = 'crosshair';
@@ -122,8 +116,18 @@ export class AimSystem {
     this.emitAimChanged();
   }
 
-  public setMaxDragDistance(maxDragDistance: number): void {
-    this.activeMaxDragDistance = Math.max(20, maxDragDistance);
+  public setMaxPullDistance(maxPullDistancePx: number): void {
+    this.activeMaxPullDistance = Math.max(24, maxPullDistancePx);
+  }
+
+  public cancelDrag(): void {
+    if (!this.dragging && this.powerRatio === 0) {
+      return;
+    }
+
+    this.dragging = false;
+    this.powerRatio = 0;
+    this.emitAimChanged();
   }
 
   public destroy(): void {
@@ -134,56 +138,37 @@ export class AimSystem {
     this.interactionLayer.off('pointercancel', this.onPointerCancel);
   }
 
-  private updateAimFromDrag(pointerPosition: PointData): void {
-    const dragStart = this.dragStart ?? {
-      x: pointerPosition.x,
-      y: pointerPosition.y,
+  private updateAimFromPointer(pointerPosition: PointData): void {
+    const origin = this.options.getAimOrigin();
+    const pullVector = {
+      x: origin.x - pointerPosition.x,
+      y: origin.y - pointerPosition.y,
     };
-    this.dragMode = this.resolveDragMode(pointerPosition.x);
+    const pullDistance = Math.hypot(pullVector.x, pullVector.y);
+    const minPullDistance = Math.max(0, this.options.minPullDistancePx ?? 14);
 
-    const dragX = pointerPosition.x - dragStart.x;
-    const dragY = pointerPosition.y - dragStart.y;
-    const dragDistance = Math.hypot(dragX, dragY);
-
-    const minAngleDragDistance = this.options.minAngleDragDistance ?? 12;
-    if (dragDistance >= minAngleDragDistance) {
-      // Front drag: follows movement direction.
-      // Behind drag: behaves like pull-back slingshot.
-      const directionX = this.dragMode === 'behind' ? -dragX : dragX;
-      const directionY = this.dragMode === 'behind' ? -dragY : dragY;
+    if (pullDistance >= Math.max(2, minPullDistance * 0.45)) {
       const targetAngle = clamp(
-        Math.atan2(directionY, directionX),
+        Math.atan2(pullVector.y, pullVector.x),
         this.options.minAngleRad,
         this.options.maxAngleRad,
       );
-      const angleSmoothing = clamp(this.options.angleSmoothing ?? 0.28, 0.05, 1);
+      const angleSmoothing = clamp(this.options.angleSmoothing ?? 0.2, 0.05, 1);
       this.angleRad = lerpAngle(this.angleRad, targetAngle, angleSmoothing);
     }
 
-    const pullDistance = dragDistance;
-    const effectivePull = Math.max(0, pullDistance - (this.options.minPullDistance ?? 8));
-    const powerScale = this.dragMode === 'behind'
-      ? (this.options.behindPowerScale ?? 1)
-      : (this.options.frontPowerScale ?? 0.45);
-    const normalized = clamp((effectivePull * powerScale) / this.activeMaxDragDistance, 0, 1);
-    const curve = this.options.powerCurveExponent ?? 0.74;
+    const effectivePull = Math.max(0, pullDistance - minPullDistance);
+    const normalized = clamp(effectivePull / this.activeMaxPullDistance, 0, 1);
+    const curve = this.options.powerCurveExponent ?? 1.24;
     this.powerRatio = Math.pow(normalized, curve);
   }
 
-  private resolveDragMode(pointerX: number): 'front' | 'behind' {
-    const origin = this.options.getAimOrigin();
-    const deltaX = pointerX - origin.x;
-    const deadzone = Math.max(0, this.options.sideSwitchDeadzone ?? 26);
-
-    if (deltaX <= -deadzone) {
-      return 'behind';
-    }
-
-    if (deltaX >= deadzone) {
-      return 'front';
-    }
-
-    return this.dragMode;
+  private toLocalPointer(pointer: PointData): Vector2 {
+    const local = this.interactionLayer.toLocal(pointer);
+    return {
+      x: local.x,
+      y: local.y,
+    };
   }
 
   private emitAimChanged(): void {
@@ -215,4 +200,8 @@ function normalizeAngle(angle: number): number {
   }
 
   return result;
+}
+
+function distance(from: PointData, to: Vector2): number {
+  return Math.hypot(from.x - to.x, from.y - to.y);
 }

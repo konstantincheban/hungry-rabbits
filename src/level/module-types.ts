@@ -14,6 +14,12 @@ export type LevelZone =
   | 'right-mid'
   | 'upper-right';
 
+export type LevelMotifKind =
+  | 'supported-tower'
+  | 'step-chain'
+  | 'cover-overhang'
+  | 'bridge-pillar';
+
 export interface GridCellLike {
   col: number;
   row: number;
@@ -44,4 +50,19 @@ export interface ModulePlacement {
   origin: GridCellLike;
   width: number;
   height: number;
+}
+
+export interface LevelMotifStep {
+  requiredKinds: ModuleKind[];
+  centerOffsetRange: [number, number];
+  rowOffsetRange: [number, number];
+}
+
+export interface LevelMotifTemplate {
+  id: string;
+  kind: LevelMotifKind;
+  zone: Exclude<LevelZone, 'left-safe'>;
+  weight: number;
+  anchorKinds: ModuleKind[];
+  linkedSteps: LevelMotifStep[];
 }

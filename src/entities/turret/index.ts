@@ -8,9 +8,16 @@ export interface TurretEntity {
   getBasePosition: () => Vector2;
   setAimAngle: (angleRad: number) => void;
   getMuzzlePosition: () => Vector2;
+  setTargetWidth: (targetWidthPx: number) => void;
 }
 
-export function createTurretEntity(): TurretEntity {
+interface CreateTurretEntityOptions {
+  targetWidthPx?: number;
+}
+
+const BASE_TARGET_WIDTH = 166;
+
+export function createTurretEntity(options: CreateTurretEntityOptions = {}): TurretEntity {
   const container = new Container();
   const barrelPivot = new Container();
 
@@ -18,13 +25,12 @@ export function createTurretEntity(): TurretEntity {
   const turretTexture = Assets.get<Texture>(ASSET_KEYS.TURRET);
 
   if (turretTexture && turretTexture !== Texture.EMPTY) {
-    const targetWidth = 166;
-    const scale = targetWidth / Math.max(1, turretTexture.width);
+    const scale = BASE_TARGET_WIDTH / Math.max(1, turretTexture.width);
     const displayWidth = turretTexture.width * scale;
     const displayHeight = turretTexture.height * scale;
     const pivotX = 0.445;
     const pivotY = 0.43;
-    const spriteLift = targetWidth * 0.24;
+    const spriteLift = BASE_TARGET_WIDTH * 0.24;
 
     const turretSprite = Sprite.from(turretTexture);
     turretSprite.anchor.set(pivotX, pivotY);
@@ -76,6 +82,14 @@ export function createTurretEntity(): TurretEntity {
     };
   }
 
+  const setTargetWidth = (targetWidthPx: number): void => {
+    const nextWidth = Math.max(88, targetWidthPx);
+    const scaleFactor = nextWidth / BASE_TARGET_WIDTH;
+    container.scale.set(scaleFactor);
+  };
+
+  setTargetWidth(options.targetWidthPx ?? BASE_TARGET_WIDTH);
+
   return {
     container,
     setPosition: (x, y) => {
@@ -90,10 +104,20 @@ export function createTurretEntity(): TurretEntity {
     },
     getMuzzlePosition: () => {
       const global = barrelPivot.toGlobal({ x: muzzleLocal.x, y: muzzleLocal.y });
+      const parent = container.parent;
+      if (!parent) {
+        return {
+          x: global.x,
+          y: global.y,
+        };
+      }
+
+      const localToParent = parent.toLocal(global);
       return {
-        x: global.x,
-        y: global.y,
+        x: localToParent.x,
+        y: localToParent.y,
       };
     },
+    setTargetWidth,
   };
 }

@@ -12,8 +12,11 @@ interface RabbitSpawnSystemOptions {
 interface RabbitSlotRuntime {
   id: number;
   position: Vector2;
+  lastPointKey: string | null;
+  lastHitPointKey: string | null;
   preferredType?: RabbitType;
   allowedTypes: RabbitType[];
+  isGround: boolean;
   rabbit: RabbitTarget | null;
   respawnRemainingMs: number;
 }
@@ -22,6 +25,7 @@ export interface RabbitSpawnPlanEntry {
   position: Vector2;
   preferredType?: RabbitType;
   allowedTypes?: RabbitType[];
+  isGround?: boolean;
 }
 
 const DEFAULT_SLOT_COUNT = 6;
@@ -34,17 +38,22 @@ export class RabbitSpawnSystem {
   private nextRabbitId = 1;
   private arenaWidth = 0;
   private groundY = 0;
+  private rabbitRadius: number;
 
   public constructor(
     private readonly layer: Container,
     private readonly options: RabbitSpawnSystemOptions,
   ) {
+    this.rabbitRadius = Math.max(10, options.rabbitRadius);
     this.slotCount = Math.max(1, Math.floor(options.slotCount ?? DEFAULT_SLOT_COUNT));
     this.slots = Array.from({ length: this.slotCount }, (_, index) => ({
       id: index,
       position: { x: 0, y: 0 },
+      lastPointKey: null,
+      lastHitPointKey: null,
       preferredType: undefined,
       allowedTypes: ['normal', 'golden'],
+      isGround: false,
       rabbit: null,
       respawnRemainingMs: 0,
     }));
@@ -61,10 +70,21 @@ export class RabbitSpawnSystem {
     this.repositionActiveRabbits();
   }
 
+  public setRabbitRadius(radius: number): void {
+    const nextRadius = Math.max(10, radius);
+    if (Math.abs(nextRadius - this.rabbitRadius) < 0.25) {
+      return;
+    }
+
+    this.rabbitRadius = nextRadius;
+    this.rebuildActiveRabbitsForRadius();
+  }
+
   public setSpawnPoints(points: Vector2[]): void {
     this.setSpawnPlan(points.map((point) => ({
       position: point,
       allowedTypes: ['normal', 'golden'],
+      isGround: this.isGroundPoint(point),
     })));
   }
 
@@ -76,6 +96,7 @@ export class RabbitSpawnSystem {
         position: { x: entry.position.x, y: entry.position.y },
         preferredType: entry.preferredType,
         allowedTypes: sanitizeAllowedTypes(entry.allowedTypes),
+        isGround: entry.isGround ?? this.isGroundPoint(entry.position),
       });
     }
 
@@ -83,6 +104,7 @@ export class RabbitSpawnSystem {
       const fallback = this.buildFallbackSpawnPoints().map((point) => ({
         position: point,
         allowedTypes: ['normal', 'golden'] as RabbitType[],
+        isGround: this.isGroundPoint(point),
       }));
       this.spawnPlan.push(...fallback);
     }
@@ -122,7 +144,9 @@ export class RabbitSpawnSystem {
     this.layer.removeChild(rabbit.container);
     rabbit.container.destroy({ children: true });
 
+    slot.lastHitPointKey = this.toPointKey(slot.position);
     slot.rabbit = null;
+    slot.isGround = false;
     slot.respawnRemainingMs = this.options.respawnDelayMs;
 
     return rabbit;
@@ -134,9 +158,13 @@ export class RabbitSpawnSystem {
         continue;
       }
 
-      slot.respawnRemainingMs -= deltaMs;
-      if (slot.respawnRemainingMs <= 0) {
-        this.spawnRabbit(slot);
+      if (slot.respawnRemainingMs > 0) {
+        slot.respawnRemainingMs -= deltaMs;
+      }
+
+      if (slot.respawnRemainingMs <= 0 && !this.spawnRabbit(slot)) {
+        // Keep retrying every update while constraints are unsatisfied.
+        slot.respawnRemainingMs = 0;
       }
     }
   }
@@ -153,14 +181,21 @@ export class RabbitSpawnSystem {
     }
   }
 
-  private spawnRabbit(slot: RabbitSlotRuntime): void {
-    const spawnEntry = this.pickSpawnEntryForRespawn(slot);
+  private spawnRabbit(slot: RabbitSlotRuntime): boolean {
+    const spawnEntry = this.pickSpawnEntry(slot);
+    if (!spawnEntry) {
+      return false;
+    }
+
     slot.position = {
       x: spawnEntry.position.x,
       y: spawnEntry.position.y,
     };
+    slot.lastPointKey = this.toPointKey(slot.position);
+    slot.lastHitPointKey = null;
     slot.preferredType = spawnEntry.preferredType;
     slot.allowedTypes = sanitizeAllowedTypes(spawnEntry.allowedTypes);
+    slot.isGround = this.isGroundEntry(spawnEntry);
     const type = this.pickRabbitType(slot);
 
     const rabbit = createRabbitTarget({
@@ -168,7 +203,7 @@ export class RabbitSpawnSystem {
       slotId: slot.id,
       type,
       position: slot.position,
-      radius: this.options.rabbitRadius,
+      radius: this.rabbitRadius,
     });
 
     this.nextRabbitId += 1;
@@ -176,52 +211,39 @@ export class RabbitSpawnSystem {
     slot.respawnRemainingMs = 0;
 
     this.layer.addChild(rabbit.container);
+    return true;
   }
 
-  private pickSpawnEntryForRespawn(slot: RabbitSlotRuntime): RabbitSpawnPlanEntry {
+  private pickSpawnEntry(slot: RabbitSlotRuntime): RabbitSpawnPlanEntry | null {
     const points = this.getSpawnCandidates();
     if (points.length === 0) {
-      return this.buildDefaultSpawnEntry();
+      const defaultEntry = this.buildDefaultSpawnEntry();
+      return this.isHardAllowedForSlot(defaultEntry, slot) ? defaultEntry : null;
     }
 
-    const occupiedSlotsByPoint = this.getOccupiedSlotsByPoint(slot.id);
-    const freePoints = points.filter((point) => !occupiedSlotsByPoint.has(this.toPointKey(point.position)));
-
-    // When only one point is free (e.g. same amount of points as alive rabbits),
-    // swap with a random live rabbit so the respawn doesn't stick to one location.
-    if (freePoints.length === 1 && occupiedSlotsByPoint.size > 0) {
-      const freePoint = freePoints[0] as RabbitSpawnPlanEntry;
-      const occupiedPoints = points.filter((point) => occupiedSlotsByPoint.has(this.toPointKey(point.position)));
-
-      if (occupiedPoints.length > 0) {
-        const targetPoint = occupiedPoints[Math.floor(Math.random() * occupiedPoints.length)] as RabbitSpawnPlanEntry;
-        const displacedSlot = occupiedSlotsByPoint.get(this.toPointKey(targetPoint.position));
-
-        if (displacedSlot) {
-          displacedSlot.position = {
-            x: freePoint.position.x,
-            y: freePoint.position.y,
-          };
-          displacedSlot.preferredType = freePoint.preferredType;
-          displacedSlot.allowedTypes = sanitizeAllowedTypes(freePoint.allowedTypes);
-
-          if (displacedSlot.rabbit) {
-            setRabbitPosition(displacedSlot.rabbit, displacedSlot.position);
-          }
-        }
-
-        return {
-          position: {
-            x: targetPoint.position.x,
-            y: targetPoint.position.y,
-          },
-          preferredType: targetPoint.preferredType,
-          allowedTypes: sanitizeAllowedTypes(targetPoint.allowedTypes),
-        };
-      }
+    const avoidPointKeys = new Set<string>();
+    if (slot.lastPointKey) {
+      avoidPointKeys.add(slot.lastPointKey);
     }
 
-    return this.pickSpawnEntry(slot.id);
+    const currentPointKey = this.toPointKey(slot.position);
+    if (currentPointKey !== '0:0') {
+      avoidPointKeys.add(currentPointKey);
+    }
+
+    const shuffled = this.shuffleSpawnEntries(points);
+    const hardAllowed = shuffled.filter((entry) => this.isHardAllowedForSlot(entry, slot));
+
+    if (hardAllowed.length === 0) {
+      return null;
+    }
+
+    const recentHitAvoided = hardAllowed.filter((entry) => !this.isPointBlockedByRecentHit(this.toPointKey(entry.position)));
+    const freshnessPool = recentHitAvoided.length > 0 ? recentHitAvoided : hardAllowed;
+    const preferred = freshnessPool.filter((entry) => !avoidPointKeys.has(this.toPointKey(entry.position)));
+    const pool = preferred.length > 0 ? preferred : freshnessPool;
+    const picked = pool[Math.floor(Math.random() * pool.length)] as RabbitSpawnPlanEntry;
+    return this.cloneSpawnEntry(picked);
   }
 
   private repositionActiveRabbits(): void {
@@ -230,48 +252,20 @@ export class RabbitSpawnSystem {
         continue;
       }
 
-      const spawnEntry = this.pickSpawnEntry(slot.id);
+      const spawnEntry = this.pickSpawnEntry(slot);
+      if (!spawnEntry) {
+        continue;
+      }
+
       slot.position = {
         x: spawnEntry.position.x,
         y: spawnEntry.position.y,
       };
       slot.preferredType = spawnEntry.preferredType;
       slot.allowedTypes = sanitizeAllowedTypes(spawnEntry.allowedTypes);
+      slot.isGround = this.isGroundEntry(spawnEntry);
       setRabbitPosition(slot.rabbit, slot.position);
     }
-  }
-
-  private pickSpawnEntry(slotId: number): RabbitSpawnPlanEntry {
-    const points = this.getSpawnCandidates();
-
-    if (points.length === 0) {
-      return this.buildDefaultSpawnEntry();
-    }
-
-    const occupied = this.getOccupiedPointKeys(slotId);
-
-    const shuffled = [...points];
-    for (let i = shuffled.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j] as RabbitSpawnPlanEntry, shuffled[i] as RabbitSpawnPlanEntry];
-    }
-
-    for (const point of shuffled) {
-      if (!occupied.has(this.toPointKey(point.position))) {
-        return {
-          position: { ...point.position },
-          preferredType: point.preferredType,
-          allowedTypes: sanitizeAllowedTypes(point.allowedTypes),
-        };
-      }
-    }
-
-    const fallback = shuffled[0] as RabbitSpawnPlanEntry;
-    return {
-      position: { ...fallback.position },
-      preferredType: fallback.preferredType,
-      allowedTypes: sanitizeAllowedTypes(fallback.allowedTypes),
-    };
   }
 
   private getSpawnCandidates(): RabbitSpawnPlanEntry[] {
@@ -282,6 +276,7 @@ export class RabbitSpawnSystem {
     return this.buildFallbackSpawnPoints().map((point) => ({
       position: point,
       allowedTypes: ['normal', 'golden'] as RabbitType[],
+      isGround: this.isGroundPoint(point),
     }));
   }
 
@@ -292,28 +287,101 @@ export class RabbitSpawnSystem {
         y: this.groundY - 120,
       },
       allowedTypes: ['normal', 'golden'],
+      isGround: false,
     };
   }
 
   private getOccupiedPointKeys(ignoreSlotId: number): Set<string> {
-    return new Set(this.getOccupiedSlotsByPoint(ignoreSlotId).keys());
-  }
-
-  private getOccupiedSlotsByPoint(ignoreSlotId: number): Map<string, RabbitSlotRuntime> {
-    const occupied = new Map<string, RabbitSlotRuntime>();
+    const occupied = new Set<string>();
 
     for (const slot of this.slots) {
       if (slot.id === ignoreSlotId || !slot.rabbit) {
         continue;
       }
 
-      occupied.set(this.toPointKey(slot.position), slot);
+      occupied.add(this.toPointKey(slot.position));
     }
+
     return occupied;
+  }
+
+  private hasActiveGroundRabbit(ignoreSlotId: number): boolean {
+    for (const slot of this.slots) {
+      if (slot.id === ignoreSlotId || !slot.rabbit) {
+        continue;
+      }
+
+      if (slot.isGround) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private isHardAllowedForSlot(entry: RabbitSpawnPlanEntry, slot: RabbitSlotRuntime): boolean {
+    const key = this.toPointKey(entry.position);
+    if (this.getOccupiedPointKeys(slot.id).has(key)) {
+      return false;
+    }
+
+    if (slot.lastHitPointKey && key === slot.lastHitPointKey) {
+      return false;
+    }
+
+    if (this.isGroundEntry(entry) && this.hasActiveGroundRabbit(slot.id)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private isPointBlockedByRecentHit(pointKey: string): boolean {
+    for (const slot of this.slots) {
+      if (slot.lastHitPointKey === pointKey) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   private toPointKey(point: Vector2): string {
     return `${Math.round(point.x)}:${Math.round(point.y)}`;
+  }
+
+  private cloneSpawnEntry(entry: RabbitSpawnPlanEntry): RabbitSpawnPlanEntry {
+    return {
+      position: { ...entry.position },
+      preferredType: entry.preferredType,
+      allowedTypes: sanitizeAllowedTypes(entry.allowedTypes),
+      isGround: this.isGroundEntry(entry),
+    };
+  }
+
+  private shuffleSpawnEntries(entries: RabbitSpawnPlanEntry[]): RabbitSpawnPlanEntry[] {
+    const shuffled = [...entries];
+
+    for (let i = shuffled.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j] as RabbitSpawnPlanEntry, shuffled[i] as RabbitSpawnPlanEntry];
+    }
+
+    return shuffled;
+  }
+
+  private isGroundEntry(entry: RabbitSpawnPlanEntry): boolean {
+    return entry.isGround ?? this.isGroundPoint(entry.position);
+  }
+
+  private isGroundPoint(point: Vector2): boolean {
+    if (this.groundY <= 0) {
+      return false;
+    }
+
+    const groundLineY = this.groundY - this.rabbitRadius - 2;
+    const tolerance = Math.max(2, this.rabbitRadius * 0.15);
+    return Math.abs(point.y - groundLineY) <= tolerance;
   }
 
   private buildFallbackSpawnPoints(): Vector2[] {
@@ -321,14 +389,16 @@ export class RabbitSpawnSystem {
       return [];
     }
 
+    const sizeScale = this.rabbitRadius / 24;
+
     return [
-      { x: this.arenaWidth * 0.52, y: this.groundY - 106 },
-      { x: this.arenaWidth * 0.65, y: this.groundY - 92 },
-      { x: this.arenaWidth * 0.79, y: this.groundY - 118 },
-      { x: this.arenaWidth * 0.58, y: this.groundY - 182 },
-      { x: this.arenaWidth * 0.73, y: this.groundY - 176 },
-      { x: this.arenaWidth * 0.86, y: this.groundY - 198 },
-      { x: this.arenaWidth * 0.9, y: this.groundY - 142 },
+      { x: this.arenaWidth * 0.52, y: this.groundY - (106 * sizeScale) },
+      { x: this.arenaWidth * 0.65, y: this.groundY - (92 * sizeScale) },
+      { x: this.arenaWidth * 0.79, y: this.groundY - (118 * sizeScale) },
+      { x: this.arenaWidth * 0.58, y: this.groundY - (182 * sizeScale) },
+      { x: this.arenaWidth * 0.73, y: this.groundY - (176 * sizeScale) },
+      { x: this.arenaWidth * 0.86, y: this.groundY - (198 * sizeScale) },
+      { x: this.arenaWidth * 0.9, y: this.groundY - (142 * sizeScale) },
     ];
   }
 
@@ -354,6 +424,29 @@ export class RabbitSpawnSystem {
     }
 
     return 'normal';
+  }
+
+  private rebuildActiveRabbitsForRadius(): void {
+    for (const slot of this.slots) {
+      if (!slot.rabbit) {
+        continue;
+      }
+
+      const previous = slot.rabbit;
+      this.layer.removeChild(previous.container);
+      previous.container.destroy({ children: true });
+
+      const rebuilt = createRabbitTarget({
+        id: previous.id,
+        slotId: slot.id,
+        type: previous.type,
+        position: slot.position,
+        radius: this.rabbitRadius,
+      });
+
+      slot.rabbit = rebuilt;
+      this.layer.addChild(rebuilt.container);
+    }
   }
 }
 

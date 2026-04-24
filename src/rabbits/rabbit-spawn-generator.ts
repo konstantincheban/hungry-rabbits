@@ -23,6 +23,7 @@ export const DEFAULT_RABBIT_SPAWN_GENERATOR_CONFIG: RabbitSpawnGeneratorConfig =
   goldenMaxCount: 1,
   minHorizontalSpreadPx: 165,
   maxBandShare: 0.5,
+  maxGroundShare: 0.12,
   easyTargetMinPerSet: 1,
   debug: false,
 };
@@ -64,6 +65,7 @@ export function generateRabbitSet(
 
   let bestAttempt: {
     rabbits: SpawnedRabbit[];
+    slots: RabbitSpawnSlot[];
     validation: ReturnType<typeof validateRabbitSet>;
     attempt: number;
   } | null = null;
@@ -107,6 +109,7 @@ export function generateRabbitSet(
     if (!bestAttempt || validation.reasons.length < bestAttempt.validation.reasons.length) {
       bestAttempt = {
         rabbits,
+        slots: selectedSlots,
         validation,
         attempt,
       };
@@ -115,7 +118,7 @@ export function generateRabbitSet(
     if (validation.valid) {
       return {
         rabbits,
-        slots,
+        slots: selectedSlots,
         validation,
         attempts: attempt,
         debugLogs: generatorConfig.debug ? debugLogs : undefined,
@@ -129,7 +132,7 @@ export function generateRabbitSet(
 
   return {
     rabbits: bestAttempt.rabbits,
-    slots,
+    slots: bestAttempt.slots,
     validation: bestAttempt.validation,
     attempts: bestAttempt.attempt,
     debugLogs: generatorConfig.debug ? debugLogs : undefined,
@@ -143,54 +146,92 @@ function selectSpawnSlots(
   rng: () => number,
 ): RabbitSpawnSlot[] {
   const selected: RabbitSpawnSlot[] = [];
-  const remaining = [...slots];
+  const selectedIds = new Set<string>();
+  const nonGroundPool = shuffle([...slots.filter((slot) => !isGroundSlot(slot))], rng);
+  const groundPool = shuffle([...slots.filter((slot) => isGroundSlot(slot))], rng);
   const maxPerBand = Math.max(1, Math.ceil(targetCount * config.maxBandShare));
+  const maxGroundCount = Math.max(0, Math.floor(targetCount * config.maxGroundShare));
   const byBandCount = new Map<string, number>();
+  let groundCount = 0;
 
-  while (selected.length < targetCount && remaining.length > 0) {
-    const weighted = remaining.map((slot) => ({
-      item: slot,
-      weight: slotWeight(slot, selected, config.minHorizontalSpreadPx),
-    }));
-    const picked = pickWeighted(weighted, rng);
-    if (!picked) {
-      break;
+  const pickFromPool = (
+    pool: RabbitSpawnSlot[],
+    options: { ignoreBandCap?: boolean; ignoreGroundCap?: boolean; allowTightSpacing?: boolean } = {},
+  ): void => {
+    while (selected.length < targetCount && pool.length > 0) {
+      const weighted = pool.map((slot) => ({
+        item: slot,
+        weight: slotWeight(slot, selected, config.minHorizontalSpreadPx, rng),
+      }));
+      const picked = pickWeighted(weighted, rng);
+      if (!picked) {
+        break;
+      }
+
+      removeSlotFromList(pool, picked.id);
+
+      if (selectedIds.has(picked.id)) {
+        continue;
+      }
+
+      const bandKey = picked.heightBand;
+      const bandCount = byBandCount.get(bandKey) ?? 0;
+      if (!options.ignoreBandCap && bandCount >= maxPerBand) {
+        continue;
+      }
+
+      if (!options.ignoreGroundCap && isGroundSlot(picked) && groundCount >= maxGroundCount) {
+        continue;
+      }
+
+      const tooClose = selected.some((existing) => (
+        Math.abs(existing.worldX - picked.worldX) < (config.minHorizontalSpreadPx * 0.42)
+        && Math.abs(existing.worldY - picked.worldY) < 84
+      ));
+      if (!options.allowTightSpacing && tooClose) {
+        continue;
+      }
+
+      selected.push(picked);
+      selectedIds.add(picked.id);
+      if (isGroundSlot(picked)) {
+        groundCount += 1;
+      }
+      byBandCount.set(bandKey, bandCount + 1);
     }
+  };
 
-    const bandKey = picked.heightBand;
-    const bandCount = byBandCount.get(bandKey) ?? 0;
-    if (bandCount >= maxPerBand) {
-      removeSlotFromList(remaining, picked.id);
-      continue;
-    }
+  // Keep ground rare by filling elevated slots first.
+  pickFromPool(nonGroundPool);
+  pickFromPool(groundPool);
 
-    const tooClose = selected.some((existing) => (
-      Math.abs(existing.worldX - picked.worldX) < (config.minHorizontalSpreadPx * 0.42)
-      && Math.abs(existing.worldY - picked.worldY) < 84
-    ));
-    if (tooClose) {
-      removeSlotFromList(remaining, picked.id);
-      continue;
-    }
-
-    selected.push(picked);
-    byBandCount.set(bandKey, bandCount + 1);
-    removeSlotFromList(remaining, picked.id);
+  // Fallback: relax constraints only to satisfy target count.
+  if (selected.length < targetCount) {
+    const leftovers = shuffle([...nonGroundPool, ...groundPool], rng);
+    pickFromPool(leftovers, {
+      ignoreBandCap: true,
+      ignoreGroundCap: true,
+      allowTightSpacing: true,
+    });
   }
 
+  // Final safety fill in randomized order.
   if (selected.length < targetCount) {
-    const left = slots
-      .filter((slot) => !selected.some((picked) => picked.id === slot.id))
-      .sort((a, b) => b.difficultyScore - a.difficultyScore);
-    for (const slot of left) {
+    const remaining = shuffle(
+      slots.filter((slot) => !selectedIds.has(slot.id)),
+      rng,
+    );
+    for (const slot of remaining) {
       if (selected.length >= targetCount) {
         break;
       }
+
       selected.push(slot);
+      selectedIds.add(slot.id);
     }
   }
 
-  return selected.slice(0, targetCount);
+  return shuffle(selected.slice(0, targetCount), rng);
 }
 
 function materializeRabbits(slots: RabbitSpawnSlot[], rabbitRadius: number): SpawnedRabbit[] {
@@ -263,6 +304,7 @@ function slotWeight(
   slot: RabbitSpawnSlot,
   selected: RabbitSpawnSlot[],
   minHorizontalSpreadPx: number,
+  rng: () => number,
 ): number {
   let spreadBonus = 1;
   for (const existing of selected) {
@@ -274,7 +316,9 @@ function slotWeight(
 
   const difficultyWeight = 0.8 + (slot.difficultyScore * 0.9);
   const goldenReadyBonus = slot.allowedTypes.includes('golden') ? 0.15 : 0;
-  return Math.max(0.05, difficultyWeight * spreadBonus + goldenReadyBonus);
+  const groundPenalty = isGroundSlot(slot) ? 0.45 : 1;
+  const randomJitter = 0.82 + (rng() * 0.42);
+  return Math.max(0.05, (difficultyWeight * spreadBonus + goldenReadyBonus) * groundPenalty * randomJitter);
 }
 
 function pickWeighted<T>(entries: Array<{ item: T; weight: number }>, rng: () => number): T | null {
@@ -307,4 +351,17 @@ function removeRabbitFromList(rabbits: SpawnedRabbit[], rabbitId: string): void 
   if (index >= 0) {
     rabbits.splice(index, 1);
   }
+}
+
+function isGroundSlot(slot: RabbitSpawnSlot): boolean {
+  return slot.sourceModuleKind === 'ground-strip';
+}
+
+function shuffle<T>(list: T[], rng: () => number): T[] {
+  for (let index = list.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(rng() * (index + 1));
+    [list[index], list[swapIndex]] = [list[swapIndex] as T, list[index] as T];
+  }
+
+  return list;
 }

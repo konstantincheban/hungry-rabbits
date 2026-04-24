@@ -6,6 +6,8 @@ interface TextButtonOptions {
   onPress: () => void;
   fontSize?: number;
   playClickSound?: boolean;
+  minTouchWidth?: number;
+  minTouchHeight?: number;
 }
 
 export interface TextButton extends Container {
@@ -16,6 +18,7 @@ export interface TextButton extends Container {
 
 export function createTextButton(options: TextButtonOptions): TextButton {
   const container = new Container() as TextButton;
+  const content = new Container();
 
   const label = new Text({
     text: options.label,
@@ -37,19 +40,23 @@ export function createTextButton(options: TextButtonOptions): TextButton {
   });
 
   label.anchor.set(0.5);
-  container.addChild(label);
+  content.addChild(label);
+  container.addChild(content);
 
   let enabled = true;
+  const minTouchWidth = Math.max(32, options.minTouchWidth ?? 44);
+  const minTouchHeight = Math.max(32, options.minTouchHeight ?? 44);
 
-  const updateHitArea = (): void => {
-    const horizontalPadding = 22;
-    const verticalPadding = 14;
+  const relayout = (): void => {
+    const fullWidth = Math.max(minTouchWidth, label.width + 20);
+    const fullHeight = Math.max(minTouchHeight, label.height + 16);
 
+    label.position.set(0, 0);
     container.hitArea = new Rectangle(
-      (-label.width / 2) - horizontalPadding,
-      (-label.height / 2) - verticalPadding,
-      label.width + (horizontalPadding * 2),
-      label.height + (verticalPadding * 2),
+      -fullWidth * 0.5,
+      -fullHeight * 0.5,
+      fullWidth,
+      fullHeight,
     );
   };
 
@@ -58,16 +65,16 @@ export function createTextButton(options: TextButtonOptions): TextButton {
       return;
     }
 
-    container.scale.set(pressed ? 0.965 : 1);
+    content.scale.set(pressed ? 0.965 : 1);
     label.alpha = pressed ? 0.88 : 1;
   };
 
   const resetVisual = (): void => {
-    container.scale.set(1);
+    content.scale.set(1);
     label.alpha = enabled ? 1 : 0.5;
   };
 
-  updateHitArea();
+  relayout();
 
   container.eventMode = 'static';
   container.cursor = 'pointer';
@@ -105,7 +112,7 @@ export function createTextButton(options: TextButtonOptions): TextButton {
 
   container.setLabel = (nextLabel: string): void => {
     label.text = nextLabel;
-    updateHitArea();
+    relayout();
   };
 
   container.setEnabled = (nextEnabled: boolean): void => {

@@ -10,23 +10,50 @@ interface ProjectileSystemOptions {
 export class ProjectileSystem {
   private readonly projectiles: CarrotProjectile[] = [];
   private nextProjectileId = 1;
+  private projectileRadius: number;
+  private gravity: number;
 
   public constructor(
     private readonly layer: Container,
     private readonly options: ProjectileSystemOptions,
-  ) {}
+  ) {
+    this.projectileRadius = Math.max(3, options.projectileRadius);
+    this.gravity = options.gravity;
+  }
 
   public spawn(position: Vector2, velocity: Vector2): void {
     const projectile = createCarrotProjectile(
       this.nextProjectileId,
       position,
       velocity,
-      this.options.projectileRadius,
+      this.projectileRadius,
     );
 
     this.nextProjectileId += 1;
     this.projectiles.push(projectile);
     this.layer.addChild(projectile.container);
+  }
+
+  public setProjectileRadius(radius: number): void {
+    const nextRadius = Math.max(3, radius);
+    if (Math.abs(nextRadius - this.projectileRadius) < 0.2) {
+      return;
+    }
+
+    for (const projectile of this.projectiles) {
+      const ratio = nextRadius / Math.max(0.001, projectile.radius);
+      projectile.radius = nextRadius;
+      projectile.container.scale.set(
+        projectile.container.scale.x * ratio,
+        projectile.container.scale.y * ratio,
+      );
+    }
+
+    this.projectileRadius = nextRadius;
+  }
+
+  public setGravity(gravity: number): void {
+    this.gravity = gravity;
   }
 
   public getProjectiles(): readonly CarrotProjectile[] {
@@ -54,7 +81,7 @@ export class ProjectileSystem {
     for (let index = this.projectiles.length - 1; index >= 0; index -= 1) {
       const projectile = this.projectiles[index];
 
-      projectile.velocity.y += this.options.gravity * deltaSeconds;
+      projectile.velocity.y += this.gravity * deltaSeconds;
       projectile.position.x += projectile.velocity.x * deltaSeconds;
       projectile.position.y += projectile.velocity.y * deltaSeconds;
       syncCarrotProjectile(projectile);

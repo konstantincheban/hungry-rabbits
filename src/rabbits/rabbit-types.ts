@@ -87,6 +87,7 @@ export interface RabbitSpawnGeneratorConfig {
   goldenMaxCount: number;
   minHorizontalSpreadPx: number;
   maxBandShare: number;
+  maxGroundShare: number;
   easyTargetMinPerSet: number;
   debug: boolean;
 }

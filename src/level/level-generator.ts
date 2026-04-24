@@ -1,5 +1,7 @@
 import {
   LEVEL_GENERATION_CONFIG,
+  LEVEL_MOTIF_CONFIG,
+  LEVEL_MOTIF_LIBRARY,
   LEVEL_ZONE_LAYOUT,
   LEVEL_ZONE_PLACEMENT_PLAN,
 } from './config';
@@ -8,7 +10,7 @@ import { buildGroundStrip, buildModuleFromTemplate } from './module-builders';
 import { getGroundStripTemplate, getZoneTemplates } from './module-library';
 import type { BuiltModule, GeneratedLevel, GeneratedLevelDraft, GridCell, GridRect, PlacedTile } from './level-types';
 import { validateGeneratedLevel } from './level-validator';
-import type { LevelZone, ModuleKind, ModuleTemplate } from './module-types';
+import type { LevelMotifTemplate, LevelZone, ModuleKind, ModuleTemplate } from './module-types';
 
 export interface GenerateLevelOptions {
   grid: LevelGrid;
@@ -175,6 +177,46 @@ function generateSingleAttempt(grid: LevelGrid, rng: () => number): GenerateAtte
       }
     }
 
+    const zoneMotifs = getZoneMotifs(zone);
+    const remainingAfterAnchor = targetCount - placedCount;
+    if (zoneMotifs.length > 0 && remainingAfterAnchor >= 2) {
+      const motifModuleTarget = clampInt(
+        Math.max(2, Math.round(targetCount * LEVEL_MOTIF_CONFIG.minCoverageShare) + 1),
+        2,
+        Math.min(4, remainingAfterAnchor),
+      );
+      const motifModules = tryPlaceMotif({
+        zone,
+        motifs: zoneMotifs,
+        templates,
+        zoneRect,
+        preferredCenterCol: spreadCenters[Math.min(placedCount, spreadCenters.length - 1)],
+        centerBiasCols,
+        targetModuleCount: motifModuleTarget,
+        turretSafeZone,
+        occupiedCells,
+        placedBounds,
+        grid,
+        rng,
+        placementLogs,
+      });
+
+      if (motifModules.length > 0) {
+        for (const module of motifModules) {
+          if (placedCount >= targetCount) {
+            break;
+          }
+
+          commitModule(module);
+          placedCount += 1;
+          placementLogs.push(
+            `[${zone}] motif placed ${module.id} at (${module.origin.col},${module.origin.row}) `
+            + `size ${module.width}x${module.height}`,
+          );
+        }
+      }
+    }
+
     for (let index = placedCount; index < targetCount; index += 1) {
       const module = tryPlaceModule({
         zone,
@@ -240,6 +282,22 @@ interface TryPlaceModuleParams {
   slotLabel: string;
 }
 
+interface TryPlaceMotifParams {
+  zone: Exclude<LevelZone, 'left-safe'>;
+  motifs: LevelMotifTemplate[];
+  templates: ModuleTemplate[];
+  zoneRect: GridRect;
+  preferredCenterCol: number;
+  centerBiasCols: number;
+  targetModuleCount: number;
+  turretSafeZone: GridRect;
+  occupiedCells: Set<string>;
+  placedBounds: GridRect[];
+  grid: LevelGrid;
+  rng: () => number;
+  placementLogs: string[];
+}
+
 function tryPlaceModule(params: TryPlaceModuleParams): BuiltModule | null {
   for (let attempt = 0; attempt < LEVEL_GENERATION_CONFIG.placementAttemptsPerModule; attempt += 1) {
     const template = pickWeightedTemplate(params.templates, params.rng);
@@ -298,6 +356,129 @@ function tryPlaceModule(params: TryPlaceModuleParams): BuiltModule | null {
   }
 
   return null;
+}
+
+function getZoneMotifs(zone: Exclude<LevelZone, 'left-safe'>): LevelMotifTemplate[] {
+  return LEVEL_MOTIF_LIBRARY.filter((motif) => motif.zone === zone);
+}
+
+function tryPlaceMotif(params: TryPlaceMotifParams): BuiltModule[] {
+  const localModuleTarget = clampInt(params.targetModuleCount, 2, 4);
+
+  for (let attempt = 0; attempt < LEVEL_MOTIF_CONFIG.attemptsPerZone; attempt += 1) {
+    const motif = pickWeightedMotif(params.motifs, params.rng);
+    if (!motif) {
+      return [];
+    }
+
+    const localOccupied = new Set(params.occupiedCells);
+    const localBounds = [...params.placedBounds];
+    const localModules: BuiltModule[] = [];
+
+    const commitLocal = (module: BuiltModule): void => {
+      localModules.push(module);
+      localBounds.push(module.bounds);
+      for (const cell of module.occupiedCells) {
+        localOccupied.add(toCellKey(cell.col, cell.row));
+      }
+    };
+
+    const anchorTemplates = params.templates.filter((template) => motif.anchorKinds.includes(template.kind));
+    if (anchorTemplates.length === 0) {
+      params.placementLogs.push(`[${params.zone}] motif ${motif.id} skip: no anchor templates`);
+      continue;
+    }
+
+    const anchor = tryPlaceModule({
+      zone: params.zone,
+      templates: anchorTemplates,
+      zoneRect: params.zoneRect,
+      preferredCenterCol: params.preferredCenterCol,
+      centerBiasCols: params.centerBiasCols,
+      turretSafeZone: params.turretSafeZone,
+      occupiedCells: localOccupied,
+      placedBounds: localBounds,
+      grid: params.grid,
+      rng: params.rng,
+      placementLogs: params.placementLogs,
+      slotLabel: `motif ${motif.id} anchor`,
+    });
+
+    if (!anchor) {
+      params.placementLogs.push(`[${params.zone}] motif ${motif.id} failed: anchor`);
+      continue;
+    }
+
+    commitLocal(anchor);
+    const anchorCenterCol = anchor.bounds.col + Math.floor(anchor.bounds.width * 0.5);
+    const anchorCenterRow = anchor.bounds.row + Math.floor(anchor.bounds.height * 0.5);
+
+    let motifFailed = false;
+    const maxStepCount = Math.min(motif.linkedSteps.length, Math.max(0, localModuleTarget - 1));
+    for (let stepIndex = 0; stepIndex < maxStepCount; stepIndex += 1) {
+      const step = motif.linkedSteps[stepIndex] as LevelMotifTemplate['linkedSteps'][number];
+      const stepTemplates = params.templates.filter((template) => step.requiredKinds.includes(template.kind));
+
+      if (stepTemplates.length === 0) {
+        motifFailed = true;
+        params.placementLogs.push(`[${params.zone}] motif ${motif.id} step #${stepIndex + 1} fail: no templates`);
+        break;
+      }
+
+      const preferredCol = anchorCenterCol + randomIntInRange(step.centerOffsetRange, params.rng);
+      const preferredRow = anchorCenterRow + randomIntInRange(step.rowOffsetRange, params.rng);
+      const stepZoneRect = createMotifStepZone(params.zoneRect, preferredCol, preferredRow);
+
+      const stepModule = tryPlaceModule({
+        zone: params.zone,
+        templates: stepTemplates,
+        zoneRect: stepZoneRect,
+        preferredCenterCol: preferredCol,
+        centerBiasCols: LEVEL_MOTIF_CONFIG.centerBiasCols,
+        turretSafeZone: params.turretSafeZone,
+        occupiedCells: localOccupied,
+        placedBounds: localBounds,
+        grid: params.grid,
+        rng: params.rng,
+        placementLogs: params.placementLogs,
+        slotLabel: `motif ${motif.id} step #${stepIndex + 1}`,
+      });
+
+      if (!stepModule) {
+        motifFailed = true;
+        params.placementLogs.push(`[${params.zone}] motif ${motif.id} step #${stepIndex + 1} fail`);
+        break;
+      }
+
+      commitLocal(stepModule);
+    }
+
+    if (motifFailed || localModules.length < 2) {
+      continue;
+    }
+
+    params.placementLogs.push(`[${params.zone}] motif ${motif.id} placed modules=${localModules.length}`);
+    return localModules;
+  }
+
+  return [];
+}
+
+function createMotifStepZone(zoneRect: GridRect, preferredCenterCol: number, preferredRow: number): GridRect {
+  const zoneMaxCol = zoneRect.col + zoneRect.width - 1;
+  const zoneMaxRow = zoneRect.row + zoneRect.height - 1;
+
+  const minCol = clampInt(preferredCenterCol - 4, zoneRect.col, zoneMaxCol);
+  const maxCol = clampInt(preferredCenterCol + 4, minCol, zoneMaxCol);
+  const minRow = clampInt(preferredRow - 3, zoneRect.row, zoneMaxRow);
+  const maxRow = clampInt(preferredRow + 3, minRow, zoneMaxRow);
+
+  return {
+    col: minCol,
+    row: minRow,
+    width: (maxCol - minCol) + 1,
+    height: (maxRow - minRow) + 1,
+  };
 }
 
 function resolveZoneBounds(grid: LevelGrid): Record<LevelZone, GridRect> {
@@ -508,6 +689,24 @@ function pickWeightedTemplate(templates: ModuleTemplate[], rng: () => number): M
   }
 
   return templates[templates.length - 1] as ModuleTemplate;
+}
+
+function pickWeightedMotif(motifs: LevelMotifTemplate[], rng: () => number): LevelMotifTemplate | null {
+  if (motifs.length === 0) {
+    return null;
+  }
+
+  const totalWeight = motifs.reduce((sum, motif) => sum + motif.weight, 0);
+  let cursor = rng() * Math.max(0.001, totalWeight);
+
+  for (const motif of motifs) {
+    cursor -= motif.weight;
+    if (cursor <= 0) {
+      return motif;
+    }
+  }
+
+  return motifs[motifs.length - 1] as LevelMotifTemplate;
 }
 
 function randomIntInRange(range: [number, number], rng: () => number): number {

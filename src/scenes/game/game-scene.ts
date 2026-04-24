@@ -33,6 +33,12 @@ import type { TurretState } from '../../rabbits/rabbit-types';
 const DEFAULT_AIM_ANGLE_RAD = 0;
 const DEFAULT_AIM_POWER = 0.52;
 const REFERENCE_WIDTH = 430;
+const MOBILE_UI_SCALE_FACTOR = 0.9;
+const FULLSCREEN_ENTER_LABEL = 'Fullscreen';
+const FULLSCREEN_EXIT_LABEL = 'Exit fullscreen';
+const GAME_SCENE_BODY_CLASS = 'game-scene-active';
+const BASE_TILE_SIZE = 24;
+const BASE_TURRET_WIDTH = 166;
 
 interface FloatingFeedback {
   label: Text;
@@ -41,12 +47,43 @@ interface FloatingFeedback {
   lifeMs: number;
 }
 
+interface GameViewport {
+  worldWidth: number;
+  worldHeight: number;
+  isMobile: boolean;
+  isPortrait: boolean;
+}
+
+interface RuntimeScale {
+  worldScale: number;
+  turretWidth: number;
+  rabbitRadius: number;
+  projectileRadius: number;
+  maxPullDistance: number;
+  turretOffsetX: number;
+  turretOffsetFromGround: number;
+  groundHeight: number;
+}
+
+const DEFAULT_RUNTIME_SCALE: RuntimeScale = {
+  worldScale: 1,
+  turretWidth: BASE_TURRET_WIDTH,
+  rabbitRadius: GAMEPLAY_CONFIG.rabbitRadius,
+  projectileRadius: GAMEPLAY_CONFIG.projectileRadius,
+  maxPullDistance: GAMEPLAY_CONFIG.maxDragDistance,
+  turretOffsetX: GAMEPLAY_CONFIG.turretOffsetX,
+  turretOffsetFromGround: GAMEPLAY_CONFIG.turretOffsetFromGround,
+  groundHeight: GAMEPLAY_CONFIG.groundHeight,
+};
+
 export function createGameScene({ sceneController }: SceneContext): Scene {
   const container = new Container();
 
+  const sceneRoot = new Container();
   const worldLayer = new Container();
   const uiLayer = new Container();
-  container.addChild(worldLayer, uiLayer);
+  sceneRoot.addChild(worldLayer, uiLayer);
+  container.addChild(sceneRoot);
 
   const backgroundTexture = (Assets.get<Texture>(ASSET_KEYS.BACKGROUND) ?? Texture.WHITE);
   const sceneBackground = Sprite.from(backgroundTexture);
@@ -77,7 +114,7 @@ export function createGameScene({ sceneController }: SceneContext): Scene {
     interactionLayer,
   );
 
-  const turret = createTurretEntity();
+  const turret = createTurretEntity({ targetWidthPx: BASE_TURRET_WIDTH });
   worldLayer.addChild(turret.container);
 
   const hud = new GameHud();
@@ -89,6 +126,17 @@ export function createGameScene({ sceneController }: SceneContext): Scene {
   const comboBanner = createBodyLabel('', 30);
   comboBanner.alpha = 0;
   uiLayer.addChild(comboBanner);
+
+  const orientationOverlay = new Container();
+  const orientationScrim = new Graphics();
+  const orientationGlyph = new Graphics();
+  const orientationTitle = createBodyLabel('Поверни пристрій', 30);
+  const orientationHint = createBodyLabel('Гра доступна лише в горизонтальному режимі', 20);
+  orientationOverlay.visible = false;
+  orientationOverlay.eventMode = 'static';
+  orientationOverlay.cursor = 'pointer';
+  orientationOverlay.addChild(orientationScrim, orientationGlyph, orientationTitle, orientationHint);
+  uiLayer.addChild(orientationOverlay);
 
   const menuButton = createTextButton({
     label: 'Головне меню',
@@ -108,7 +156,23 @@ export function createGameScene({ sceneController }: SceneContext): Scene {
     playClickSound: false,
   });
 
-  uiLayer.addChild(menuButton, soundEffectsButton);
+  const appRoot = document.getElementById('app');
+  const canUseFullscreen = !!appRoot && supportsFullscreenMode(appRoot);
+  const fullscreenButton = createTextButton({
+    label: FULLSCREEN_ENTER_LABEL,
+    onPress: () => {
+      if (!appRoot) {
+        return;
+      }
+
+      void toggleFullscreen(appRoot).then(() => {
+        syncFullscreenButton();
+      });
+    },
+    fontSize: 16,
+  });
+
+  uiLayer.addChild(menuButton, soundEffectsButton, fullscreenButton);
 
   const session = createInitialSessionState(GAMEPLAY_CONFIG.initialAmmo);
 
@@ -147,10 +211,18 @@ export function createGameScene({ sceneController }: SceneContext): Scene {
   let comboBannerBaseScale = 1;
   let aimPowerRatio = DEFAULT_AIM_POWER;
   let shotSpeedMultiplier = 1;
-  let effectiveMaxDragDistance = GAMEPLAY_CONFIG.maxDragDistance;
+  let effectiveMaxPullDistance = GAMEPLAY_CONFIG.maxDragDistance;
+  let runtimeScale = DEFAULT_RUNTIME_SCALE;
   let constructions: RectBounds[] = [];
   let levelGrid: LevelGrid | null = null;
   let generatedLevel: GeneratedLevel | null = null;
+  let lastViewport: GameViewport | null = null;
+  let orientationBlocked = false;
+  let fullscreenAutoAttempted = false;
+  let orientationLockAttempted = false;
+  const onFullscreenChange = (): void => {
+    syncFullscreenButton();
+  };
 
   const onEscapeKeyDown = (event: KeyboardEvent): void => {
     if (event.key !== 'Escape') {
@@ -164,14 +236,11 @@ export function createGameScene({ sceneController }: SceneContext): Scene {
   const aimSystem = new AimSystem(interactionLayer, {
     minAngleRad: degreesToRadians(GAMEPLAY_CONFIG.minAimAngleDeg),
     maxAngleRad: degreesToRadians(GAMEPLAY_CONFIG.maxAimAngleDeg),
-    maxDragDistance: GAMEPLAY_CONFIG.maxDragDistance,
-    minPullDistance: 32,
-    minAngleDragDistance: 24,
+    maxPullDistancePx: GAMEPLAY_CONFIG.maxDragDistance,
+    activationRadiusPx: 156,
+    minPullDistancePx: 8,
     angleSmoothing: 0.16,
-    frontPowerScale: 0.38,
-    behindPowerScale: 1.08,
-    sideSwitchDeadzone: 34,
-    powerCurveExponent: 1.28,
+    powerCurveExponent: 0.86,
     getAimOrigin: () => turret.getBasePosition(),
     canShoot: () => !roundFinished && !leavingToMenu && shootingSystem.canShoot(),
     onAimChanged: ({ angleRad, powerRatio, isDragging }) => {
@@ -222,6 +291,84 @@ export function createGameScene({ sceneController }: SceneContext): Scene {
 
   function syncSoundEffectsLabel(): void {
     soundEffectsButton.setLabel(getSoundEffectsLabel(audioSystem.isEnabled()));
+  }
+
+  function syncFullscreenButton(viewport: GameViewport | null = lastViewport): void {
+    const shouldShow = !!viewport?.isMobile && canUseFullscreen;
+    fullscreenButton.visible = shouldShow;
+    fullscreenButton.setEnabled(shouldShow);
+    fullscreenButton.setLabel(isFullscreenActive() ? FULLSCREEN_EXIT_LABEL : FULLSCREEN_ENTER_LABEL);
+  }
+
+  function tryEnterFullscreenFromGesture(): void {
+    if (fullscreenAutoAttempted || !canUseFullscreen || !appRoot) {
+      return;
+    }
+
+    fullscreenAutoAttempted = true;
+    if (!lastViewport?.isMobile || isFullscreenActive()) {
+      syncFullscreenButton();
+      return;
+    }
+
+    void requestFullscreen(appRoot).then(() => {
+      syncFullscreenButton();
+    });
+  }
+
+  function tryLockLandscapeFromGesture(): void {
+    if (orientationLockAttempted) {
+      return;
+    }
+
+    orientationLockAttempted = true;
+    if (!lastViewport?.isMobile) {
+      return;
+    }
+
+    const orientationApi = screen.orientation as ScreenOrientation & {
+      lock?: (orientation: 'landscape') => Promise<void>;
+    };
+    if (!orientationApi || typeof orientationApi.lock !== 'function') {
+      return;
+    }
+
+    void orientationApi.lock('landscape').catch(() => {
+      // Keep overlay fallback when lock is unsupported or blocked by browser policy.
+    });
+  }
+
+  function onAnyUserGesture(): void {
+    audioSystem.unlockFromGesture();
+    tryEnterFullscreenFromGesture();
+    tryLockLandscapeFromGesture();
+  }
+
+  function syncOrientationOverlay(width: number, height: number): void {
+    orientationOverlay.visible = orientationBlocked;
+    orientationOverlay.hitArea = new Rectangle(0, 0, width, height);
+    orientationOverlay.eventMode = orientationBlocked ? 'static' : 'none';
+    if (!orientationBlocked) {
+      return;
+    }
+
+    orientationScrim.clear();
+    orientationScrim.rect(0, 0, width, height);
+    orientationScrim.fill({ color: 0x020617, alpha: 0.86 });
+
+    const iconSize = clamp(Math.min(width, height) * 0.22, 68, 128);
+    drawRotateDeviceGlyph(orientationGlyph, iconSize);
+    orientationGlyph.position.set(width * 0.5, height * 0.34);
+
+    const uiScale = clamp(Math.min(width / 560, height / 320), 0.74, 1.2);
+    orientationTitle.scale.set(uiScale);
+    orientationHint.scale.set(uiScale);
+
+    orientationTitle.x = width * 0.5;
+    orientationTitle.y = orientationGlyph.y + (iconSize * 0.64);
+
+    orientationHint.x = width * 0.5;
+    orientationHint.y = orientationTitle.y + (46 * uiScale);
   }
 
   function showComboBanner(text: string, color: number): void {
@@ -446,7 +593,7 @@ export function createGameScene({ sceneController }: SceneContext): Scene {
     }
   }
 
-  function updateConstructionLayout(width: number, groundY: number): void {
+  function updateConstructionLayout(width: number, groundY: number, scale: RuntimeScale): void {
     const debugGeneration = import.meta.env.DEV && LEVEL_GENERATION_CONFIG.debugEnabled;
 
     levelGrid = createLevelGrid({
@@ -480,8 +627,8 @@ export function createGameScene({ sceneController }: SceneContext): Scene {
       arenaWidth: width,
       arenaHeight: arenaBounds.height,
       groundY,
-      rabbitRadius: GAMEPLAY_CONFIG.rabbitRadius,
-      projectileRadius: GAMEPLAY_CONFIG.projectileRadius,
+      rabbitRadius: scale.rabbitRadius,
+      projectileRadius: scale.projectileRadius,
       gravity: GAMEPLAY_CONFIG.gravity,
       minShotSpeed: GAMEPLAY_CONFIG.minShotSpeed * shotSpeedMultiplier,
       maxShotSpeed: GAMEPLAY_CONFIG.maxShotSpeed * shotSpeedMultiplier,
@@ -490,6 +637,7 @@ export function createGameScene({ sceneController }: SceneContext): Scene {
       generatorConfig: {
         targetRabbitCount: 6,
         maxAttempts: 24,
+        maxGroundShare: 0.12,
         debug: debugGeneration,
       },
       validatorConfig: {
@@ -526,23 +674,34 @@ export function createGameScene({ sceneController }: SceneContext): Scene {
         },
         preferredType: preferredTypeBySlotId.get(slot.id),
         allowedTypes: slot.allowedTypes,
+        isGround: slot.sourceModuleKind === 'ground-strip',
       })));
     } else {
       const fallbackPoints = buildSpawnPointsFromGeneratedLevel(
         generatedLevel,
         levelGrid,
-        GAMEPLAY_CONFIG.rabbitRadius,
+        scale.rabbitRadius,
         width,
         groundY,
       );
-      rabbitSpawnSystem.setSpawnPoints(fallbackPoints);
+      const fallbackGroundLineY = groundY - scale.rabbitRadius - 2;
+      const fallbackGroundTolerance = Math.max(2, scale.rabbitRadius * 0.15);
+      rabbitSpawnSystem.setSpawnPlan(fallbackPoints.map((point) => ({
+        position: {
+          x: point.x,
+          y: point.y,
+        },
+        allowedTypes: ['normal', 'golden'],
+        isGround: Math.abs(point.y - fallbackGroundLineY) <= fallbackGroundTolerance,
+      })));
     }
 
     rabbitSpawnSystem.fillInitialSlots();
   }
 
   function spawnMissEffect(position: Vector2): void {
-    const missParticles = createMissParticles(position, GAMEPLAY_CONFIG.missParticleCount + 5);
+    const scaledCount = Math.round((GAMEPLAY_CONFIG.missParticleCount + 5) * clamp(runtimeScale.worldScale, 0.8, 1.3));
+    const missParticles = createMissParticles(position, scaledCount);
 
     for (const particle of missParticles) {
       particleLayer.addChild(particle.display);
@@ -719,6 +878,9 @@ export function createGameScene({ sceneController }: SceneContext): Scene {
     onEnter: () => {
       roundFinished = false;
       leavingToMenu = false;
+      fullscreenAutoAttempted = false;
+      orientationLockAttempted = false;
+      document.body.classList.add(GAME_SCENE_BODY_CLASS);
 
       if (arenaBounds.width > 0 && arenaBounds.height > 0) {
         rabbitSpawnSystem.fillInitialSlots();
@@ -726,56 +888,105 @@ export function createGameScene({ sceneController }: SceneContext): Scene {
 
       comboBanner.alpha = 0;
       syncSoundEffectsLabel();
+      syncFullscreenButton();
       syncHud();
 
       window.addEventListener('keydown', onEscapeKeyDown);
+      document.addEventListener('fullscreenchange', onFullscreenChange);
+      document.addEventListener('webkitfullscreenchange', onFullscreenChange as EventListener);
+      interactionLayer.on('pointerdown', onAnyUserGesture);
+      orientationOverlay.on('pointerdown', onAnyUserGesture);
     },
     onResize: (width, height) => {
+      const viewport = computeGameViewport(width, height);
+      lastViewport = viewport;
+      const sceneWidth = viewport.worldWidth;
+      const sceneHeight = viewport.worldHeight;
+
+      sceneRoot.rotation = 0;
+      sceneRoot.position.set(0, 0);
+      worldLayer.scale.set(1);
+      worldLayer.position.set(0, 0);
+      uiLayer.scale.set(1);
+      uiLayer.position.set(0, 0);
+
+      orientationBlocked = viewport.isMobile && viewport.isPortrait;
+
+      const scaleLayout = resolveRuntimeScaleForScene(sceneWidth, sceneHeight);
+      runtimeScale = scaleLayout.scale;
+
       arenaBounds = {
-        width,
-        height,
-        groundY: height - GAMEPLAY_CONFIG.groundHeight,
+        width: sceneWidth,
+        height: sceneHeight,
+        groundY: scaleLayout.groundY,
       };
+      syncOrientationOverlay(sceneWidth, sceneHeight);
 
       redrawArena();
 
-      const turretX = Math.max(GAMEPLAY_CONFIG.turretOffsetX, width * 0.12);
-      const turretY = arenaBounds.groundY - GAMEPLAY_CONFIG.turretOffsetFromGround;
+      turret.setTargetWidth(runtimeScale.turretWidth);
+      const turretX = Math.max(runtimeScale.turretOffsetX, sceneWidth * 0.12);
+      const turretY = arenaBounds.groundY - runtimeScale.turretOffsetFromGround;
       turret.setPosition(turretX, turretY);
 
-      effectiveMaxDragDistance = computeAdaptiveMaxDragDistance(width, height);
-      aimSystem.setMaxDragDistance(effectiveMaxDragDistance);
+      projectileSystem.setProjectileRadius(runtimeScale.projectileRadius);
+      projectileSystem.setGravity(GAMEPLAY_CONFIG.gravity * clamp(runtimeScale.worldScale, 0.88, 1.18));
+      rabbitSpawnSystem.setRabbitRadius(runtimeScale.rabbitRadius);
 
-      shotSpeedMultiplier = computeShotSpeedMultiplier(width);
+      effectiveMaxPullDistance = runtimeScale.maxPullDistance;
+      aimSystem.setMaxPullDistance(effectiveMaxPullDistance);
 
-      updateConstructionLayout(width, arenaBounds.groundY);
+      shotSpeedMultiplier = computeShotSpeedMultiplier(sceneWidth, runtimeScale.worldScale);
 
-      interactionLayer.hitArea = new Rectangle(0, 0, width, height);
+      updateConstructionLayout(sceneWidth, arenaBounds.groundY, runtimeScale);
 
-      const uiScale = clamp(Math.min(width / 390, height / 820), 0.78, 1);
+      interactionLayer.hitArea = new Rectangle(0, 0, sceneWidth, sceneHeight);
+      interactionLayer.eventMode = orientationBlocked ? 'none' : 'static';
+
+      const baseUiScale = clamp(Math.min(sceneWidth / 390, sceneHeight / 820), 0.78, 1);
+      const uiScale = viewport.isMobile
+        ? clamp(baseUiScale * MOBILE_UI_SCALE_FACTOR, 0.68, 0.95)
+        : baseUiScale;
       hint.scale.set(uiScale);
-      hint.x = width * 0.5;
+      hint.x = sceneWidth * 0.5;
       hint.y = Math.max(22, 28 * uiScale);
 
       comboBannerBaseScale = uiScale;
       comboBanner.scale.set(comboBannerBaseScale);
-      comboBanner.x = width * 0.5;
-      comboBanner.y = Math.max(70, height * 0.26);
+      comboBanner.x = sceneWidth * 0.5;
+      comboBanner.y = Math.max(70, sceneHeight * 0.26);
 
-      const utilityButtonScale = clamp(Math.min(width / 420, height / 900), 0.76, 1);
+      const baseUtilityScale = clamp(Math.min(sceneWidth / 420, sceneHeight / 900), 0.76, 1);
+      const utilityButtonScale = viewport.isMobile
+        ? clamp(baseUtilityScale * MOBILE_UI_SCALE_FACTOR, 0.68, 0.94)
+        : baseUtilityScale;
       menuButton.scale.set(utilityButtonScale);
       soundEffectsButton.scale.set(utilityButtonScale);
 
-      menuButton.x = width - (74 * utilityButtonScale);
+      menuButton.x = sceneWidth - (74 * utilityButtonScale);
       menuButton.y = Math.max(26, 30 * utilityButtonScale);
 
-      soundEffectsButton.x = width - (102 * utilityButtonScale);
+      soundEffectsButton.x = sceneWidth - (102 * utilityButtonScale);
       soundEffectsButton.y = menuButton.y + (28 * utilityButtonScale);
 
-      hud.resize(width, height);
-      drawAimGuide(aimSystem.getAngleRad(), aimSystem.getPowerRatio(), false);
+      fullscreenButton.scale.set(utilityButtonScale);
+      fullscreenButton.x = soundEffectsButton.x;
+      fullscreenButton.y = soundEffectsButton.y + (28 * utilityButtonScale);
+      syncFullscreenButton(viewport);
+
+      hud.resize(sceneWidth, sceneHeight);
+      if (orientationBlocked) {
+        aimSystem.cancelDrag();
+        drawAimGuide(aimSystem.getAngleRad(), 0, false);
+      } else {
+        drawAimGuide(aimSystem.getAngleRad(), aimSystem.getPowerRatio(), false);
+      }
     },
     update: (deltaMs) => {
+      if (orientationBlocked) {
+        return;
+      }
+
       const deltaSeconds = deltaMs / 1000;
 
       projectileSystem.update(deltaSeconds, arenaBounds, handleMiss);
@@ -790,6 +1001,11 @@ export function createGameScene({ sceneController }: SceneContext): Scene {
     },
     onExit: () => {
       window.removeEventListener('keydown', onEscapeKeyDown);
+      document.removeEventListener('fullscreenchange', onFullscreenChange);
+      document.removeEventListener('webkitfullscreenchange', onFullscreenChange as EventListener);
+      interactionLayer.off('pointerdown', onAnyUserGesture);
+      orientationOverlay.off('pointerdown', onAnyUserGesture);
+      document.body.classList.remove(GAME_SCENE_BODY_CLASS);
 
       aimSystem.destroy();
       projectileSystem.destroy();
@@ -945,18 +1161,90 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-function computeAdaptiveMaxDragDistance(width: number, height: number): number {
+function computeGameViewport(width: number, height: number): GameViewport {
   const shortSide = Math.min(width, height);
-  const fromShortSide = shortSide * 0.42;
-  const fromWidth = width * 0.31;
-  const adaptive = Math.max(160, Math.min(fromShortSide, fromWidth));
+  const isMobile = shortSide <= 900;
+  const isPortrait = height > width;
 
-  return clamp(adaptive, 160, GAMEPLAY_CONFIG.maxDragDistance);
+  return {
+    worldWidth: width,
+    worldHeight: height,
+    isMobile,
+    isPortrait,
+  };
 }
 
-function computeShotSpeedMultiplier(sceneWidth: number): number {
+function resolveRuntimeScaleForScene(sceneWidth: number, sceneHeight: number): {
+  scale: RuntimeScale;
+  groundY: number;
+} {
+  let groundY = sceneHeight - GAMEPLAY_CONFIG.groundHeight;
+  let scale = DEFAULT_RUNTIME_SCALE;
+
+  // One refinement step keeps tile-size-derived scale and ground offsets consistent.
+  for (let pass = 0; pass < 2; pass += 1) {
+    const grid = createLevelGrid({
+      arenaWidth: sceneWidth,
+      arenaHeight: sceneHeight,
+      groundY,
+    });
+    scale = deriveRuntimeScaleFromGrid(grid);
+    groundY = sceneHeight - scale.groundHeight;
+  }
+
+  return {
+    scale,
+    groundY,
+  };
+}
+
+function deriveRuntimeScaleFromGrid(grid: LevelGrid): RuntimeScale {
+  const worldScale = clamp(grid.tileSize / BASE_TILE_SIZE, 0.78, 1.3);
+
+  return {
+    worldScale,
+    turretWidth: clamp(BASE_TURRET_WIDTH * worldScale, 120, 232),
+    rabbitRadius: clamp(GAMEPLAY_CONFIG.rabbitRadius * worldScale, 15, 38),
+    projectileRadius: clamp(GAMEPLAY_CONFIG.projectileRadius * worldScale, 6, 16),
+    maxPullDistance: clamp(GAMEPLAY_CONFIG.maxDragDistance * worldScale * 0.72, 92, 210),
+    turretOffsetX: clamp(GAMEPLAY_CONFIG.turretOffsetX * worldScale, 54, 132),
+    turretOffsetFromGround: clamp(GAMEPLAY_CONFIG.turretOffsetFromGround * worldScale, 8, 34),
+    groundHeight: clamp(GAMEPLAY_CONFIG.groundHeight * worldScale, 86, 176),
+  };
+}
+
+function computeShotSpeedMultiplier(sceneWidth: number, worldScale: number): number {
   const normalized = sceneWidth / REFERENCE_WIDTH;
-  return clamp(0.95 + ((normalized - 1) * 0.55), 0.95, 1.7);
+  const widthFactor = clamp(0.95 + ((normalized - 1) * 0.55), 0.95, 1.7);
+  return clamp(widthFactor * clamp(worldScale, 0.9, 1.16), 0.92, 1.78);
+}
+
+function drawRotateDeviceGlyph(glyph: Graphics, size: number): void {
+  const half = size * 0.5;
+  const phoneW = size * 0.32;
+  const phoneH = size * 0.52;
+
+  glyph.clear();
+  glyph.roundRect(-phoneW * 0.5, -phoneH * 0.5, phoneW, phoneH, size * 0.08);
+  glyph.stroke({ color: 0xe2e8f0, width: clamp(size * 0.045, 2, 6), alpha: 0.95 });
+
+  glyph.roundRect(-phoneH * 0.26, -phoneW * 0.42, phoneH * 0.52, phoneW * 0.84, size * 0.07);
+  glyph.stroke({ color: 0x38bdf8, width: clamp(size * 0.036, 2, 5), alpha: 0.9 });
+
+  glyph.arc(-half * 0.2, -half * 0.22, half * 0.72, Math.PI * 0.18, Math.PI * 0.87);
+  glyph.stroke({ color: 0xf8fafc, width: clamp(size * 0.04, 2, 5), alpha: 0.88 });
+
+  const arrowTipX = (-half * 0.2) + (Math.cos(Math.PI * 0.87) * half * 0.72);
+  const arrowTipY = (-half * 0.22) + (Math.sin(Math.PI * 0.87) * half * 0.72);
+  glyph.poly([
+    arrowTipX,
+    arrowTipY,
+    arrowTipX - (size * 0.14),
+    arrowTipY - (size * 0.02),
+    arrowTipX - (size * 0.05),
+    arrowTipY + (size * 0.12),
+  ]);
+  glyph.fill({ color: 0xf8fafc, alpha: 0.92 });
 }
 
 function mixColors(fromColor: number, toColor: number, t: number): number {
@@ -973,4 +1261,88 @@ function mixColors(fromColor: number, toColor: number, t: number): number {
   const mixedB = Math.round(fromB + ((toB - fromB) * clamped));
 
   return (mixedR << 16) | (mixedG << 8) | mixedB;
+}
+
+interface FullscreenCapableElement extends HTMLElement {
+  webkitRequestFullscreen?: () => Promise<void> | void;
+  mozRequestFullScreen?: () => Promise<void> | void;
+  msRequestFullscreen?: () => Promise<void> | void;
+}
+
+interface FullscreenCapableDocument extends Document {
+  webkitFullscreenElement?: Element | null;
+  mozFullScreenElement?: Element | null;
+  msFullscreenElement?: Element | null;
+  webkitExitFullscreen?: () => Promise<void> | void;
+  mozCancelFullScreen?: () => Promise<void> | void;
+  msExitFullscreen?: () => Promise<void> | void;
+}
+
+function supportsFullscreenMode(element: HTMLElement): boolean {
+  const target = element as FullscreenCapableElement;
+
+  return Boolean(
+    target.requestFullscreen
+      || target.webkitRequestFullscreen
+      || target.mozRequestFullScreen
+      || target.msRequestFullscreen,
+  );
+}
+
+function isFullscreenActive(): boolean {
+  const doc = document as FullscreenCapableDocument;
+
+  return Boolean(
+    doc.fullscreenElement
+      || doc.webkitFullscreenElement
+      || doc.mozFullScreenElement
+      || doc.msFullscreenElement,
+  );
+}
+
+async function toggleFullscreen(element: HTMLElement): Promise<void> {
+  if (isFullscreenActive()) {
+    await exitFullscreen();
+    return;
+  }
+
+  await requestFullscreen(element);
+}
+
+async function requestFullscreen(element: HTMLElement): Promise<void> {
+  const target = element as FullscreenCapableElement;
+  const request =
+    target.requestFullscreen?.bind(target)
+    ?? target.webkitRequestFullscreen?.bind(target)
+    ?? target.mozRequestFullScreen?.bind(target)
+    ?? target.msRequestFullscreen?.bind(target);
+
+  if (!request) {
+    return;
+  }
+
+  try {
+    await request();
+  } catch {
+    // Ignore user-agent restrictions (gesture timing, permissions, etc.).
+  }
+}
+
+async function exitFullscreen(): Promise<void> {
+  const doc = document as FullscreenCapableDocument;
+  const exit =
+    doc.exitFullscreen?.bind(doc)
+    ?? doc.webkitExitFullscreen?.bind(doc)
+    ?? doc.mozCancelFullScreen?.bind(doc)
+    ?? doc.msExitFullscreen?.bind(doc);
+
+  if (!exit) {
+    return;
+  }
+
+  try {
+    await exit();
+  } catch {
+    // Ignore if browser blocks or no fullscreen session exists.
+  }
 }
